@@ -440,14 +440,12 @@ async def nuke_all_slash(interaction: discord.Interaction):
             super().__init__(timeout=None)
             # 初期は無効化
             self.confirm_button.disabled = True
-            self.cancel_button.disabled = True
             # 5秒後に有効化
             asyncio.create_task(self.enable_later())
 
         async def enable_later(self):
             await asyncio.sleep(5)
             self.confirm_button.disabled = False
-            self.cancel_button.disabled = False
             await _edit(content=warning + '\n\n**削除する/やめる** を選んでください。', view=self)
 
         @discord.ui.button(label='削除する', style=discord.ButtonStyle.danger, custom_id='nuke_confirm')
