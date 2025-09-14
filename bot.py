@@ -227,19 +227,39 @@ async def restore_slash(interaction: discord.Interaction):
     if os.path.exists(ROLE_FILE):
         with open(ROLE_FILE, 'r', encoding='utf-8') as f:
             stored_roles = json.load(f)
-        for r in stored_roles:
+        # 高いpositionから順に処理（上から積む）
+        for r in sorted(stored_roles, key=lambda x: x.get('position', 0), reverse=True):
+            target_pos = int(r.get('position', 0))
             perms = discord.Permissions(r['permissions'])
             existing = discord.utils.get(guild.roles, name=r['name'])
-            if existing:
-                try:
-                    await existing.edit(permissions=perms, colour=discord.Colour(r['color']), hoist=r['hoist'], mentionable=r['mentionable'])
-                except Exception:
-                    pass
-            else:
-                try:
-                    await guild.create_role(name=r['name'], permissions=perms, colour=discord.Colour(r['color']), hoist=r['hoist'], mentionable=r['mentionable'])
-                except Exception:
-                    pass
+            try:
+                if existing:
+                    try:
+                        await existing.edit(permissions=perms, colour=discord.Colour(r['color']), hoist=r['hoist'], mentionable=r['mentionable'])
+                    except Exception:
+                        pass
+                    try:
+                        if existing.position != target_pos:
+                            await existing.edit(position=target_pos)
+                            await asyncio.sleep(0.15)
+                    except Exception:
+                        pass
+                else:
+                    created = await guild.create_role(
+                        name=r['name'],
+                        permissions=perms,
+                        colour=discord.Colour(r['color']),
+                        hoist=r['hoist'],
+                        mentionable=r['mentionable']
+                    )
+                    try:
+                        if created.position != target_pos:
+                            await created.edit(position=target_pos)
+                            await asyncio.sleep(0.15)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     else:
         stored_roles = []
 
