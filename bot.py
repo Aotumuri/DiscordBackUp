@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from discord import app_commands
+from datetime import datetime
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -14,7 +15,8 @@ intents = discord.Intents.default()
 intents.guilds = True
 enable_members = os.getenv('ENABLE_MEMBERS_INTENT', '0').lower() in ('1', 'true', 'yes')
 intents.members = bool(enable_members)
-intents.message_content = False
+enable_msg_content = os.getenv('ENABLE_MESSAGE_CONTENT_INTENT', '0').lower() in ('1', 'true', 'yes')
+intents.message_content = bool(enable_msg_content)
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
@@ -25,6 +27,8 @@ VOICE_FILE = os.path.join(BACKUP_DIR, 'voice_channels.json')
 CATEGORY_FILE = os.path.join(BACKUP_DIR, 'categories.json')
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
+CHAT_DIR = os.path.join(BACKUP_DIR, 'chat')
+os.makedirs(CHAT_DIR, exist_ok=True)
 
 def guild_only_and_owner():
     def predicate(ctx):
@@ -198,6 +202,207 @@ async def backup_slash(interaction: discord.Interaction):
     await _progress(f'🎉 バックアップ完了。ロール {len(roles)} 件・カテゴリ {len(categories)} 件・テキスト {len(text_channels)} 件・ボイス {len(voice_channels)} 件を保存しました。')
     # 追加でログを残したい場合は下記をコメント解除
     # await interaction.followup.send('バックアップ完了（詳細は上の進行メッセージ参照）', ephemeral=True)
+
+@bot.tree.command(
+    name='backup_chat',
+    description='このチャンネルの直近メッセージを保存します（デフォルト100件）。',
+    guild=discord.Object(id=int(os.getenv('GUILD_ID'))) if os.getenv('GUILD_ID') else None,
+)
+@app_guild_only_and_owner()
+@app_commands.describe(count='保存する件数（既定: 100, 最大: 1000）')
+async def backup_chat_slash(interaction: discord.Interaction, count: int = 100):
+    await interaction.response.defer(ephemeral=True)
+
+    # validate channel type
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return await interaction.followup.send('テキストチャンネル/スレッドで実行してください。', ephemeral=True)
+
+    # Require Message Content intent for reliable content capture
+    if not intents.message_content:
+        return await interaction.followup.send(
+            'メッセージ本文を取得できませんでした。`ENABLE_MESSAGE_CONTENT_INTENT=1` を .env に設定し、Developer Portal で **Message Content Intent** を有効化してください。',
+            ephemeral=True,
+        )
+
+    count = max(1, min(int(count), 1000))
+
+    async def _progress(msg: str):
+        try:
+            await interaction.edit_original_response(content=msg)
+        except Exception:
+            try:
+                await interaction.followup.send(msg, ephemeral=True)
+            except Exception:
+                pass
+
+    await _progress(f'💾 チャットのバックアップを開始… 取得件数: {count}')
+
+    messages = []
+    fetched = 0
+    try:
+        async for m in channel.history(limit=count, oldest_first=False):
+            # attachments metadata only（URLは貼り付けで復元）
+            atts = [{'filename': a.filename, 'url': a.url, 'content_type': a.content_type} for a in m.attachments]
+            embeds = [e.to_dict() for e in m.embeds] if m.embeds else []
+            stickers = [{'id': s.id, 'name': s.name, 'format_type': getattr(s, 'format', None)} for s in getattr(m, 'stickers', [])]
+            reactions = [{'emoji': str(r.emoji), 'count': r.count} for r in m.reactions]
+
+            # Prefer normal content; fall back to system_content when content is empty (join/pinなど)
+            content_text = m.content if isinstance(getattr(m, 'content', None), str) else None
+            if not content_text:
+                content_text = getattr(m, 'system_content', None)
+
+            messages.append({
+                'id': m.id,
+                'author_id': getattr(m.author, 'id', None),
+                'author_name': getattr(m.author, 'display_name', getattr(m.author, 'name', None)),
+                'content': content_text or '',
+                'created_at': m.created_at.isoformat() if getattr(m, 'created_at', None) else None,
+                'attachments': atts,
+                'embeds': embeds,
+                'stickers': stickers,
+                'reactions': reactions,
+                'reference': {
+                    'message_id': getattr(m.reference, 'message_id', None) if getattr(m, 'reference', None) else None,
+                    'channel_id': getattr(getattr(m, 'reference', None), 'channel_id', None),
+                } if getattr(m, 'reference', None) else None,
+                'type': int(getattr(m, 'type', 0)) if hasattr(m, 'type') else 0,
+            })
+            fetched += 1
+            if fetched % 50 == 0:
+                await _progress(f'📥 取得中… {fetched}/{count}')
+    except discord.Forbidden:
+        return await _progress('権限不足でメッセージを取得できませんでした。（Message Content Intent が必要な場合があります）')
+
+    # 保存は古い順に
+    messages.reverse()
+
+    safe_name = channel.name if hasattr(channel, 'name') and channel.name else f'chan_{channel.id}'
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    filename = f"{safe_name}__{ts}.json"
+    path = os.path.join(CHAT_DIR, filename)
+
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'channel_id': channel.id,
+            'channel_name': safe_name,
+            'saved_at': ts,
+            'count': len(messages),
+            'messages': messages,
+        }, f, ensure_ascii=False, indent=2)
+
+    await _progress(f'✅ チャットのバックアップ完了: backup/chat/{filename}（{len(messages)}件）')
+
+@bot.tree.command(
+    name='restore_chat',
+    description='このチャンネル名と一致するチャットバックアップから復元します。',
+    guild=discord.Object(id=int(os.getenv('GUILD_ID'))) if os.getenv('GUILD_ID') else None,
+)
+@app_guild_only_and_owner()
+async def restore_chat_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return await interaction.followup.send('テキストチャンネル/スレッドで実行してください。', ephemeral=True)
+
+    safe_name = channel.name if hasattr(channel, 'name') and channel.name else f'chan_{channel.id}'
+
+    # 候補の探索
+    candidates = []
+    for fn in sorted(os.listdir(CHAT_DIR)):
+        if not fn.endswith('.json'):
+            continue
+        if fn.startswith(f"{safe_name}__") or fn == f"{safe_name}.json":
+            full = os.path.join(CHAT_DIR, fn)
+            try:
+                stat = os.stat(full)
+                candidates.append((fn, stat.st_mtime))
+            except Exception:
+                continue
+
+    if not candidates:
+        return await interaction.followup.send('このチャンネル名に一致するチャットバックアップが見つかりません。', ephemeral=True)
+
+    # 新しい順に最大25件を選択肢に
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    choices = candidates[:25]
+
+    async def _edit(content=None, view=None):
+        try:
+            await interaction.edit_original_response(content=content, view=view)
+        except Exception:
+            try:
+                await interaction.followup.send(content or '\u200b', view=view, ephemeral=True)
+            except Exception:
+                pass
+
+    class SelectBackupView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            options = []
+            for fn, _ in choices:
+                label = fn.replace(f"{safe_name}__", "")[:-5]
+                options.append(discord.SelectOption(label=label, value=fn, description=fn[-20:]))
+            self.selector = discord.ui.Select(placeholder='復元するバックアップを選んでください', options=options, min_values=1, max_values=1)
+            self.selector.callback = self.on_select
+            self.add_item(self.selector)
+
+        async def on_select(self, interaction_btn: discord.Interaction):
+            await self.restore_selected(interaction_btn, self.selector.values[0])
+
+        async def restore_selected(self, interaction_btn: discord.Interaction, filename: str):
+            # ビューを無効化
+            for item in self.children:
+                item.disabled = True
+            await _edit(content=f'📤 復元を開始します… {filename}', view=self)
+
+            full = os.path.join(CHAT_DIR, filename)
+            try:
+                with open(full, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            except Exception as e:
+                return await _edit(content=f'読み込みに失敗しました: {e}', view=None)
+
+            msgs = payload.get('messages', [])
+            # 投稿は順序通り（古い→新しい）
+            sent = 0
+            for m in msgs:
+                content = m.get('content')
+                # Fallback: if content is empty, try to summarize embeds
+                if not content:
+                    embeds = m.get('embeds') or []
+                    if embeds:
+                        titles = [e.get('title') for e in embeds if isinstance(e, dict)]
+                        descs = [e.get('description') for e in embeds if isinstance(e, dict)]
+                        summary = ' / '.join([t for t in titles if t]) or ''
+                        if descs and not summary:
+                            summary = (descs[0] or '')[:200]
+                        if summary:
+                            content = f"[EMBED] {summary}"
+                atts = m.get('attachments') or []
+                if atts:
+                    att_lines = "\n".join([f"[添付] {a.get('filename')} → {a.get('url')}" for a in atts])
+                    content = ((content or '') + "\n\n" + att_lines).strip()
+                if not content or content.strip() == '':
+                    content = '(空メッセージ)'
+                try:
+                    await channel.send(content)
+                    sent += 1
+                    if sent % 20 == 0:
+                        await _edit(content=f'⏳ 復元中… {sent}/{len(msgs)}', view=self)
+                    # 軽いウェイトでRate Limitを回避
+                    await asyncio.sleep(0.35)
+                except Exception:
+                    # 送信失敗はスキップ
+                    pass
+
+            await _edit(content=f'✅ 復元完了: {sent}/{len(msgs)} 件を投稿しました。', view=None)
+
+    view = SelectBackupView()
+    await _edit(content='候補が見つかりました。復元するバックアップを選んでください。', view=view)
+
 
 @bot.tree.command(
     name='restore',
@@ -523,6 +728,11 @@ if __name__ == '__main__':
     else:
         if enable_members:
             print('WARNING: ENABLE_MEMBERS_INTENT is set. Make sure you enabled "Server Members Intent" in the Discord Developer Portal for this application.')
+        if intents.message_content and not enable_msg_content:
+            # no-op safeguard
+            pass
+        if os.getenv('ENABLE_MESSAGE_CONTENT_INTENT', '0').lower() in ('1','true','yes'):
+            print('WARNING: ENABLE_MESSAGE_CONTENT_INTENT is set. Ensure "Message Content Intent" is enabled in the Developer Portal if your bot is in 100+ servers.')
         try:
             bot.run(TOKEN)
         except discord.errors.PrivilegedIntentsRequired as e:
