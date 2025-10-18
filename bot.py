@@ -6,6 +6,25 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
+def _parse_reaction_emoji(s):
+    if not s:
+        return None
+    try:
+        return discord.PartialEmoji.from_str(s)
+    except Exception:
+        return s
+
+def _find_forum(guild: discord.Guild, name: str, category_name: str | None):
+    target_cat_id = None
+    if category_name:
+        cat = discord.utils.get(guild.categories, name=category_name)
+        target_cat_id = getattr(cat, 'id', None)
+    for ch in guild.channels:
+        if isinstance(ch, discord.ForumChannel) and ch.name == name:
+            if (target_cat_id is None and ch.category is None) or (ch.category and ch.category.id == target_cat_id):
+                return ch
+    return None
+
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 OWNER_ID = os.getenv('OWNER_ID')
@@ -22,6 +41,7 @@ BACKUP_DIR = os.path.join(os.path.dirname(__file__), 'backup')
 ROLE_FILE = os.path.join(BACKUP_DIR, 'roles.json')
 TEXT_FILE = os.path.join(BACKUP_DIR, 'text_channels.json')
 VOICE_FILE = os.path.join(BACKUP_DIR, 'voice_channels.json')
+FORUM_FILE = os.path.join(BACKUP_DIR, 'forum_channels.json')
 CATEGORY_FILE = os.path.join(BACKUP_DIR, 'categories.json')
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -165,7 +185,61 @@ async def backup_slash(interaction: discord.Interaction):
         })
     with open(TEXT_FILE, 'w', encoding='utf-8') as f:
         json.dump(text_channels, f, ensure_ascii=False, indent=2)
-    await _progress(f'✅ テキストチャンネル {len(text_channels)} 件を保存。次：ボイスチャンネル…')
+    await _progress(f'✅ テキストチャンネル {len(text_channels)} 件を保存。次：フォーラム…')
+
+    await _progress('📚 フォーラムをバックアップ中…')
+    forum_channels = []
+    for ch in guild.channels:
+        if isinstance(ch, discord.ForumChannel):
+            overwrites = {}
+            for target, perm in ch.overwrites.items():
+                if isinstance(target, discord.Role):
+                    key = target.name
+                    ttype = 'role'
+                else:
+                    key = str(getattr(target, 'id', target))
+                    ttype = 'member'
+                allow = perm.pair()[0].value
+                deny = perm.pair()[1].value
+                overwrites[key] = {
+                    'target_type': ttype,
+                    'allow': allow,
+                    'deny': deny,
+                }
+
+            tags = []
+            for t in getattr(ch, 'available_tags', []) or []:
+                try:
+                    emoji_str = str(t.emoji) if t.emoji else None
+                except Exception:
+                    emoji_str = None
+                tags.append({
+                    'name': t.name,
+                    'emoji': emoji_str,
+                    'moderated': getattr(t, 'moderated', False),
+                })
+
+            try:
+                default_reaction = str(ch.default_reaction_emoji) if ch.default_reaction_emoji else None
+            except Exception:
+                default_reaction = None
+
+            forum_channels.append({
+                'name': ch.name,
+                'category': ch.category.name if ch.category else None,
+                'position': ch.position,
+                'nsfw': ch.nsfw,
+                'topic': getattr(ch, 'topic', None),
+                'default_thread_slowmode_delay': getattr(ch, 'default_thread_slowmode_delay', None),
+                'default_reaction_emoji': default_reaction,
+                'default_layout': getattr(ch.default_layout, 'name', None) if getattr(ch, 'default_layout', None) else None,
+                'default_sort_order': getattr(ch.default_sort_order, 'name', None) if getattr(ch, 'default_sort_order', None) else None,
+                'overwrites': overwrites,
+                'available_tags': tags,
+            })
+    with open(FORUM_FILE, 'w', encoding='utf-8') as f:
+        json.dump(forum_channels, f, ensure_ascii=False, indent=2)
+    await _progress(f'✅ フォーラム {len(forum_channels)} 件を保存。次：ボイスチャンネル…')
 
     await _progress('🔈 ボイスチャンネルをバックアップ中…')
     # Voice channels
@@ -347,7 +421,95 @@ async def restore_slash(interaction: discord.Interaction):
     else:
         stored_text = []
 
-    await _progress(f'✅ テキストチャンネル {len(stored_text) if os.path.exists(TEXT_FILE) else 0} 件を復元。次：ボイスチャンネル…')
+    await _progress(f'✅ テキストチャンネル {len(stored_text) if os.path.exists(TEXT_FILE) else 0} 件を復元。次：フォーラム…')
+
+    await _progress('📚 フォーラムを復元中…')
+    if os.path.exists(FORUM_FILE):
+        with open(FORUM_FILE, 'r', encoding='utf-8') as f:
+            stored_forum = json.load(f)
+        for ch in stored_forum:
+            category = cat_map.get(ch['category']) if ch.get('category') else None
+            if category is None and ch.get('category'):
+                category = discord.utils.get(guild.categories, name=ch.get('category'))
+
+            overwrites = {}
+            for target_id, perm in (ch.get('overwrites') or {}).items():
+                if perm.get('target_type') == 'role':
+                    target = role_map.get(target_id)
+                else:
+                    try:
+                        target = guild.get_member(int(target_id)) or None
+                    except Exception:
+                        target = None
+                if target is None:
+                    continue
+                try:
+                    allow_bits = int(perm.get('allow', 0))
+                    deny_bits = int(perm.get('deny', 0))
+                    allow_perm = discord.Permissions(allow_bits)
+                    deny_perm = discord.Permissions(deny_bits)
+                    ow = discord.PermissionOverwrite.from_pair(allow_perm, deny_perm)
+                    overwrites[target] = ow
+                except Exception:
+                    continue
+
+            tag_objs = []
+            for t in (ch.get('available_tags') or []):
+                try:
+                    emoji_val = _parse_reaction_emoji(t.get('emoji')) if t.get('emoji') else None
+                    tag_objs.append(discord.ForumTag(name=t.get('name'), emoji=emoji_val, moderated=bool(t.get('moderated', False))))
+                except Exception:
+                    pass
+
+            default_reaction = _parse_reaction_emoji(ch.get('default_reaction_emoji'))
+
+            existed = _find_forum(guild, ch['name'], ch.get('category'))
+
+            create_forum_func = getattr(guild, 'create_forum', None) or getattr(guild, 'create_forum_channel', None)
+
+            kwargs = dict(
+                category=category,
+                position=ch.get('position', None),
+                nsfw=ch.get('nsfw', False),
+                topic=ch.get('topic'),
+                default_thread_slowmode_delay=ch.get('default_thread_slowmode_delay'),
+                default_reaction_emoji=default_reaction,
+                available_tags=tag_objs or None,
+                overwrites=dict(overwrites),
+            )
+
+            if hasattr(discord, 'ForumLayout') and ch.get('default_layout'):
+                try:
+                    kwargs['default_layout'] = getattr(discord.ForumLayout, ch['default_layout'])
+                except Exception:
+                    pass
+            if hasattr(discord, 'SortOrder') and ch.get('default_sort_order'):
+                try:
+                    kwargs['default_sort_order'] = getattr(discord.SortOrder, ch['default_sort_order'])
+                except Exception:
+                    pass
+
+            try:
+                if existed:
+                    edit_kwargs = {k: v for k, v in kwargs.items() if k not in ('available_tags', 'default_layout', 'default_sort_order')}
+                    try:
+                        await existed.edit(**edit_kwargs)
+                    except Exception:
+                        pass
+                    if tag_objs:
+                        try:
+                            await existed.set_available_tags(tag_objs)
+                        except Exception:
+                            pass
+                else:
+                    if create_forum_func is not None:
+                        await create_forum_func(ch['name'], **kwargs)
+            except Exception:
+                pass
+    else:
+        stored_forum = []
+
+    await _progress(f'✅ フォーラム {len(stored_forum) if os.path.exists(FORUM_FILE) else 0} 件を復元。次：ボイスチャンネル…')
 
     await _progress('🔈 ボイスチャンネルを復元中…')
     if os.path.exists(VOICE_FILE):
@@ -389,6 +551,7 @@ async def restore_slash(interaction: discord.Interaction):
         f'🎉 復元完了。ロール {len(stored_roles) if os.path.exists(ROLE_FILE) else 0} 件・'
         f'カテゴリ {len(stored_categories) if os.path.exists(CATEGORY_FILE) else 0} 件・'
         f'テキスト {len(stored_text) if os.path.exists(TEXT_FILE) else 0} 件・'
+        f'フォーラム {len(stored_forum) if os.path.exists(FORUM_FILE) else 0} 件・'
         f'ボイス {len(stored_voice) if os.path.exists(VOICE_FILE) else 0} 件を復元しました。'
     )
 
