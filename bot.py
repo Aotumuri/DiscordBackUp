@@ -572,13 +572,15 @@ async def nuke_all_slash(interaction: discord.Interaction):
     # 対象の収集（現在のチャンネルは最後まで残す）
     keep_channel = interaction.channel
     text_targets = [c for c in guild.text_channels if c.id != getattr(keep_channel, 'id', None)]
-    voice_targets = list(guild.voice_channels)
+    forum_targets = [c for c in guild.channels if isinstance(c, discord.ForumChannel) and c.id != getattr(keep_channel, 'id', None)]
+    voice_targets = [c for c in guild.voice_channels if c.id != getattr(keep_channel, 'id', None)]
     category_targets = list(guild.categories)
     role_targets = [r for r in guild.roles if (not r.is_default()) and (not r.managed)]  # @everyone と連携ロール除外(権限なしになるので)
 
     warning = (
         '⚠️ **超危険**: 次のリソースを削除します\n'
         f'- テキストチャンネル: {len(text_targets)}\n'
+        f'- フォーラム: {len(forum_targets)}\n'
         f'- ボイスチャンネル: {len(voice_targets)}\n'
         f'- カテゴリ: {len(category_targets)}\n'
         f'- ロール: {len(role_targets)}（@everyone/連携ロール除く）\n\n'
@@ -631,7 +633,18 @@ async def nuke_all_slash(interaction: discord.Interaction):
                         await progress(f'🧹 テキストチャンネル削除中… {deleted_text}/{len(text_targets)}')
                 except Exception:
                     pass
-            await progress(f'✅ テキストチャンネル {deleted_text}/{len(text_targets)} 削除完了。次：ボイスチャンネル…')
+            await progress(f'✅ テキストチャンネル {deleted_text}/{len(text_targets)} 削除完了。次：フォーラム…')
+
+            deleted_forum = 0
+            for ch in list(forum_targets):
+                try:
+                    await ch.delete(reason='nuke_all by owner')
+                    deleted_forum += 1
+                    if deleted_forum % 5 == 0:
+                        await progress(f'🧹 フォーラム削除中… {deleted_forum}/{len(forum_targets)}')
+                except Exception:
+                    pass
+            await progress(f'✅ フォーラム {deleted_forum}/{len(forum_targets)} 削除完了。次：ボイスチャンネル…')
 
             deleted_voice = 0
             for ch in list(voice_targets):
