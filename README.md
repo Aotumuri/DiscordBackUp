@@ -22,7 +22,9 @@ Discord バックアップボット
 
 2. 実行 
 
+```sh
     source venv/bin/activate && python bot.py
+```
 
 使い方:
 - サーバーで bot に管理者権限を付与してください（ロールとチャンネルの復元に必要です）
